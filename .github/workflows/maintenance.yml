@@ -12,12 +12,13 @@ name: Scheduled maintenance
 # GitHub OIDC (audience = API origin, exact repository/ref/workflow_ref), and
 # every run mints a short-lived token that the API verifies and burns once.
 #
-# Hourly is deliberately below OPERATIONS_MAX_STALE_MS (2 hours) and allows
-# Render Free to spin down between runs. GitHub drops or delays schedules
-# queued at the top of the hour under load, so the minute is offset.
+# Three shots per hour keep maintenance inside OPERATIONS_MAX_STALE_MS
+# (2 hours) even when GitHub delivers a slot hours late, and Render Free can
+# still spin down between calls. Minutes avoid the top of the hour, where
+# GitHub drops or delays schedules under load.
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '7,27,47 * * * *'
   workflow_dispatch:
 
 permissions:
