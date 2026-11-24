@@ -30,3 +30,10 @@ writes a SHA-256 sidecar and manifest, uploads all three to the separate S3
 bucket and applies retention. Backup credentials exist only as encrypted
 GitHub Actions secrets and are never printed. Restore remains an explicit,
 confirmed operation using `scripts/restore.sh`; it is never scheduled.
+
+An authorized `workflow_dispatch` may override `backup_interval_hours`; `0`
+forces a verification backup. Scheduled and dispatcher runs use the default of
+24 hours. On 2026-11-24, run `45452755762` created a real encrypted artifact
+whose SHA-256 sidecar and GPG decryption were verified and whose dump was
+accepted by `pg_restore --list` (34 tables). Run `45453266656` then confirmed
+the normal not-due path without creating another dump.
