@@ -1,0 +1,117 @@
+name: Scheduled maintenance
+
+# Public-repository trigger for the ZUNO API maintenance endpoint.
+#
+# Why this lives in a public repository: GitHub's schedule trigger has been
+# failing for private repositories since 2026-08-26 (no run object is created
+# at all), while scheduled workflows in public repositories keep firing.
+# See https://github.com/orgs/community/discussions/206019 and
+# https://github.com/orgs/community/discussions/212710
+#
+# The repository holds no secrets: the API trusts this workflow through
+# GitHub OIDC (audience = API origin, exact repository/ref/workflow_ref), and
+# every run mints a short-lived token that the API verifies and burns once.
+#
+# Hourly is deliberately below OPERATIONS_MAX_STALE_MS (2 hours) and allows
+# Render Free to spin down between runs. GitHub drops or delays schedules
+# queued at the top of the hour under load, so the minute is offset.
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: zuno-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    name: Run bounded outbox, purge and scheduler maintenance
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Public API origin, without a trailing slash/path. It is also the exact
+      # OIDC audience configured as OPERATIONS_OIDC_AUDIENCE on the API.
+      ZUNO_API_URL: ${{ vars.ZUNO_API_URL }}
+      REQUEST_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check production scheduler configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ZUNO_API_URL:?Set the ZUNO_API_URL repository variable to the HTTPS API origin}"
+          node - <<'NODE'
+          const value = process.env.ZUNO_API_URL;
+          const url = new URL(value);
+          if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+            throw new Error('ZUNO_API_URL must be an HTTPS origin without credentials, path, query or fragment');
+          }
+          NODE
+      - name: Call authenticated maintenance endpoint with GitHub OIDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC request URL is unavailable}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is unavailable}"
+          request_body="$(jq -nc \
+            --arg requestId "$REQUEST_ID" \
+            '{tasks:["outbox","purge","schedulers"],batchSize:50,timeBudgetMs:20000,requestId:$requestId}')"
+          header_file="$(mktemp "$RUNNER_TEMP/zuno-oidc-header.XXXXXX")"
+          trap 'rm -f "$header_file"' EXIT
+          response=''
+          succeeded=false
+
+          # A fresh OIDC token is requested for every API attempt. The stable
+          # requestId still makes retries idempotent, while each new jti avoids
+          # colliding with the API's single-use replay protection.
+          for attempt in 1 2 3; do
+            if ! oidc_response="$(curl --silent --show-error --fail-with-body \
+              --proto '=https' --tlsv1.2 \
+              --connect-timeout 10 --max-time 30 \
+              --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              --get --data-urlencode "audience=${ZUNO_API_URL}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}")"; then
+              echo "GitHub OIDC token request failed on attempt ${attempt}." >&2
+            elif ! oidc_token="$(jq -er '.value | select(type == "string" and length > 0)' <<<"$oidc_response")"; then
+              echo "GitHub OIDC response did not contain a token on attempt ${attempt}." >&2
+            else
+              # curl reads the header from a private file so the bearer token is
+              # never printed or exposed in the API command's arguments.
+              printf 'Authorization: Bearer %s\n' "$oidc_token" > "$header_file"
+              chmod 600 "$header_file"
+              if response="$(curl --silent --show-error --fail-with-body \
+                --proto '=https' --tlsv1.2 \
+                --connect-timeout 15 --max-time 90 \
+                --header 'Content-Type: application/json' \
+                --header "@${header_file}" \
+                --data-binary "$request_body" \
+                "${ZUNO_API_URL%/}/api/v1/operations/maintenance")"; then
+                succeeded=true
+                break
+              fi
+              echo "Maintenance request failed on attempt ${attempt}." >&2
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 5
+            fi
+          done
+
+          if [ "$succeeded" != true ]; then
+            echo 'Maintenance did not succeed after three fresh OIDC attempts.' >&2
+            exit 1
+          fi
+          printf '%s\n' "$response" | jq .
+          # The API wraps every successful body in {data: ...} (ResponseInterceptor).
+          printf '%s\n' "$response" | jq -e '
+            .data.ok == true and
+            (.data.budgetExhausted != true) and
+            ([.data.schedulerHooks[]? | select(.status == "failed")] | length == 0)
+          ' >/dev/null
+          if printf '%s\n' "$response" | jq -e 'any(.data.schedulerHooks[]?; .status == "not_configured")' >/dev/null; then
+            echo '::warning::Scheduler hooks returned not_configured; outbox/purge ran, but domain schedulers are not wired.'
+          fi
