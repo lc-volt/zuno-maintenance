@@ -2,10 +2,15 @@
 
 Scheduled trigger for the ZUNO API maintenance endpoint.
 
-GitHub's `schedule` trigger stopped creating runs for **private** repositories
-in August 2026, while schedules in public repositories keep firing. This
-public repository only exists to host the hourly trigger; the ZUNO codebase
-itself stays in a private repository.
+GitHub's `schedule` trigger has been unreliable since August 2026: it stopped
+creating runs for private repositories and, as observed on 2026-11-24, also
+created no runs for this public repository even with a new every-minute probe.
+The workflow therefore keeps both `schedule` and `workflow_dispatch`, but an
+external dispatcher is required for reliable maintenance. The ZUNO codebase
+stays in a private repository; its `scripts/dispatch-maintenance.mjs` is
+registered as the Windows task `ZUNO Maintenance Dispatcher`, which calls this
+workflow every 20 minutes and skips when a recent run already exists. The task
+uses the GitHub credential already stored on that machine and never prints it.
 
 There are no credentials here. The API trusts this workflow through GitHub
 OIDC: the token's `repository`, `ref`, `workflow` and `workflow_ref` claims must
