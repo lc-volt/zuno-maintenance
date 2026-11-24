@@ -8,9 +8,11 @@ name: Scheduled maintenance
 # See https://github.com/orgs/community/discussions/206019 and
 # https://github.com/orgs/community/discussions/212710
 #
-# The repository holds no secrets: the API trusts this workflow through
+# The repository holds no plaintext credentials. API authentication uses only
 # GitHub OIDC (audience = API origin, exact repository/ref/workflow_ref), and
 # every run mints a short-lived token that the API verifies and burns once.
+# The separate backup job receives only encrypted GitHub Actions secrets and
+# runs on this trusted runner, never inside the public web container.
 #
 # Three shots per hour keep maintenance inside OPERATIONS_MAX_STALE_MS
 # (2 hours) even when GitHub delivers a slot hours late, and Render Free can
@@ -18,7 +20,7 @@ name: Scheduled maintenance
 # GitHub drops or delays schedules under load.
 on:
   schedule:
-    - cron: '7,27,47 * * * *'
+    - cron: "7,27,47 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -115,4 +117,75 @@ jobs:
           ' >/dev/null
           if printf '%s\n' "$response" | jq -e 'any(.data.schedulerHooks[]?; .status == "not_configured")' >/dev/null; then
             echo '::warning::Scheduler hooks returned not_configured; outbox/purge ran, but domain schedulers are not wired.'
+          fi
+
+  backup:
+    name: Run due encrypted offsite backup
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+      BACKUP_ENCRYPTION_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
+      BACKUP_S3_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+      BACKUP_S3_REGION: ${{ secrets.BACKUP_S3_REGION }}
+      BACKUP_S3_PREFIX: ${{ secrets.BACKUP_S3_PREFIX }}
+      BACKUP_S3_ENDPOINT_URL: ${{ secrets.BACKUP_S3_ENDPOINT_URL }}
+      BACKUP_S3_ACCESS_KEY_ID: ${{ secrets.BACKUP_S3_ACCESS_KEY_ID }}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_S3_SECRET_ACCESS_KEY }}
+      BACKUP_RETENTION_DAYS: "30"
+      BACKUP_INTERVAL_HOURS: "24"
+    steps:
+      - name: Check out trusted backup scripts
+        uses: actions/checkout@v4
+
+      - name: Check backup runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in node pg_dump psql gpg sha256sum aws jq; do
+            command -v "$tool" >/dev/null || { echo "Required backup tool is missing: $tool" >&2; exit 1; }
+          done
+
+      - name: Run encrypted backup only when due
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${BACKUP_DATABASE_URL:?Set the BACKUP_DATABASE_URL Actions secret}"
+          : "${BACKUP_ENCRYPTION_PASSPHRASE:?Set the BACKUP_ENCRYPTION_PASSPHRASE Actions secret}"
+          : "${BACKUP_S3_BUCKET:?Set the BACKUP_S3_BUCKET Actions secret}"
+          : "${BACKUP_S3_REGION:?Set the BACKUP_S3_REGION Actions secret}"
+          : "${BACKUP_S3_ACCESS_KEY_ID:?Set the BACKUP_S3_ACCESS_KEY_ID Actions secret}"
+          : "${BACKUP_S3_SECRET_ACCESS_KEY:?Set the BACKUP_S3_SECRET_ACCESS_KEY Actions secret}"
+
+          prefix="${BACKUP_S3_PREFIX:-zuno}"
+          prefix="${prefix%/}/"
+          interval_seconds=$((BACKUP_INTERVAL_HOURS * 3600))
+          due=true
+          latest=''
+          if latest="$(aws s3api list-objects-v2 \
+            --bucket "$BACKUP_S3_BUCKET" \
+            --prefix "$prefix" \
+            --output json | jq -r '
+              [.Contents[]?
+               | select(.Key | endswith(".sql.dump.gpg"))
+               | .LastModified]
+              | sort | last // empty
+            ')"; then
+            if [ -n "$latest" ]; then
+              latest_epoch="$(date -u -d "$latest" +%s)"
+              now_epoch="$(date -u +%s)"
+              if (( now_epoch - latest_epoch < interval_seconds )); then
+                due=false
+                echo "Backup is not due; newest object is $latest."
+              fi
+            fi
+          else
+            echo '::warning::Backup listing failed; running now rather than missing the backup window.'
+          fi
+
+          if [ "$due" = true ]; then
+            bash scripts/backup.sh
           fi
