@@ -2,15 +2,12 @@
 
 Trusted external runner for ZUNO API maintenance and encrypted offsite backups.
 
-GitHub's `schedule` trigger has been unreliable since August 2026: it stopped
-creating runs for private repositories and, as observed on 2026-11-24, also
-created no runs for this public repository even with a new every-minute probe.
-The workflow therefore keeps both `schedule` and `workflow_dispatch`, but an
-external dispatcher is required for reliable maintenance. The ZUNO codebase
-stays in a private repository; its `scripts/dispatch-maintenance.mjs` is
-registered as the Windows task `ZUNO Maintenance Dispatcher`, which calls this
-workflow every 20 minutes and skips when a recent run already exists. The task
-uses the GitHub credential already stored on that machine and never prints it.
+GitHub's `schedule` trigger has been unreliable for private repositories since
+August 2026. This public repository therefore owns the 20-minute schedule, while
+the ZUNO codebase stays private. The Windows task `ZUNO Maintenance Dispatcher`
+is a reinforcement: it calls this workflow every 20 minutes and skips when a
+recent run already exists. The task uses the GitHub credential already stored on
+that machine and never prints it.
 
 The API job authenticates only through GitHub OIDC. The token's `repository`,
 `ref`, `workflow` and `workflow_ref` claims must match the API's
@@ -30,6 +27,16 @@ writes a SHA-256 sidecar and manifest, uploads all three to the separate S3
 bucket and applies retention. Backup credentials exist only as encrypted
 GitHub Actions secrets and are never printed. Restore remains an explicit,
 confirmed operation using `scripts/restore.sh`; it is never scheduled.
+
+After a new backup is published, `scripts/verify-backup.sh` downloads the
+canonical object and sidecar, validates SHA-256, decrypts it and checks the dump
+with `pg_restore --list`. It never restores data. Success and failure are
+reported to `POST /api/v1/operations/backup-status` with the dedicated
+`BACKUP_STATUS_TOKEN` Actions secret; the same value is configured on Render as
+`BACKUP_STATUS_TOKEN`. `BACKUP_STATUS_URL` is derived from `ZUNO_API_URL` and
+must be the exact HTTPS endpoint. Reports contain only bounded status codes and
+timestamps, never credentials or raw provider errors. The API exposes freshness,
+failure and verification gauges to Prometheus.
 
 An authorized `workflow_dispatch` may override `backup_interval_hours`; `0`
 forces a verification backup. Scheduled and dispatcher runs use the default of

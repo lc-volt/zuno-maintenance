@@ -143,9 +143,27 @@ jobs:
       BACKUP_S3_SECRET_ACCESS_KEY: ${{ secrets.BACKUP_S3_SECRET_ACCESS_KEY }}
       BACKUP_RETENTION_DAYS: "30"
       BACKUP_INTERVAL_HOURS: ${{ inputs.backup_interval_hours || '24' }}
+      BACKUP_STATUS_URL: ${{ vars.ZUNO_API_URL }}/api/v1/operations/backup-status
+      BACKUP_STATUS_TOKEN: ${{ secrets.BACKUP_STATUS_TOKEN }}
+      NODE_ENV: production
     steps:
       - name: Check out trusted backup scripts
         uses: actions/checkout@v5
+
+      - name: Check backup status reporting configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${BACKUP_STATUS_URL:?Set the ZUNO_API_URL repository variable}"
+          : "${BACKUP_STATUS_TOKEN:?Set the BACKUP_STATUS_TOKEN Actions secret}"
+          node --input-type=module - <<'NODE'
+          import { validateStatusUrl } from './scripts/backup-status-reporter.mjs';
+          validateStatusUrl(process.env.BACKUP_STATUS_URL, { production: true });
+          const token = process.env.BACKUP_STATUS_TOKEN;
+          if (typeof token !== 'string' || token.length < 32 || token.length > 512) {
+            throw new Error('BACKUP_STATUS_TOKEN must contain 32 to 512 characters.');
+          }
+          NODE
 
       - name: Check backup runner tools
         shell: bash
@@ -156,6 +174,7 @@ jobs:
           done
 
       - name: Run encrypted backup only when due
+        id: backup
         shell: bash
         run: |
           set -euo pipefail
@@ -201,3 +220,11 @@ jobs:
           if [ "$due" = true ]; then
             bash scripts/backup.sh
           fi
+          printf 'due=%s\n' "$due" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the new backup without restoring data
+        if: steps.backup.outputs.due == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-backup.sh

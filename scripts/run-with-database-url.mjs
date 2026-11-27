@@ -37,16 +37,17 @@ try {
 
 const environment = { ...process.env };
 delete environment.DATABASE_URI;
-environment.PGHOST = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+environment.PGHOST = url.hostname.startsWith('[')
+  ? url.hostname.slice(1, -1)
+  : url.hostname;
 environment.PGPORT = url.port || '5432';
 environment.PGUSER = username;
 environment.PGPASSWORD = password;
 environment.PGDATABASE = database;
 environment.PGCONNECT_TIMEOUT ||= '15';
 
-// A libpq URI passed through the PGDATABASE environment variable is treated
-// as a literal database name by libpq. Decompose supported URI parameters into
-// their PG* equivalents instead, preserving TLS/channel-binding requirements.
+// O libpq trata uma URI em PGDATABASE como um nome literal de banco. Por isso,
+// separamos os parâmetros da URI em variáveis PG*, preservando TLS e channel binding.
 const parameterNames = {
   host: 'PGHOST',
   hostaddr: 'PGHOSTADDR',
@@ -77,7 +78,7 @@ const parameterNames = {
 };
 for (const [rawKey, value] of url.searchParams) {
   const key = rawKey.toLowerCase();
-  if (key === 'schema') continue; // Handled as a libpq search_path setting below.
+  if (key === 'schema') continue; // O schema vira search_path do libpq logo abaixo.
   const environmentKey = parameterNames[key];
   if (!environmentKey) fail(`DATABASE_URI parameter is not supported: ${key}`);
   environment[environmentKey] = value;
@@ -108,9 +109,8 @@ const hasDatabaseArgument = args.some(
     argument.startsWith('--dbname=') ||
     (argument.startsWith('-d') && argument.length > 2),
 );
-// pg_restore requires an explicit database selector even when libpq parameters
-// are supplied through PG* environment variables. Pass only the database name;
-// host, user, password and TLS settings remain outside the process arguments.
+// O pg_restore precisa de um banco explícito mesmo quando as opções vêm das
+// variáveis PG*. Passamos só o nome; host, usuário, senha e TLS ficam fora dos argumentos.
 const toolArgs =
   commandName === 'pg_restore' && !hasDatabaseArgument
     ? ['--dbname', environment.PGDATABASE, ...args]
@@ -129,6 +129,8 @@ const result = spawnSync(
 );
 
 if (result.error)
-  fail(`Unable to execute ${command}: ${result.error.code ?? result.error.message}`);
+  fail(
+    `Unable to execute ${command}: ${result.error.code ?? result.error.message}`,
+  );
 if (result.signal) fail(`${command} terminated by signal ${result.signal}.`);
 process.exit(result.status ?? 1);

@@ -1,10 +1,77 @@
 #!/usr/bin/env bash
-# Encrypted, checksummed PostgreSQL custom-format backup to a separate S3 bucket.
-# Requires PostgreSQL client tools, Node.js, GnuPG and sha256sum. The AWS SDK
-# fallback removes the AWS CLI dependency for S3-compatible providers such as Neon.
-# Secrets never appear in arguments.
+# Backup PostgreSQL customizado, criptografado e com checksum, enviado a um bucket
+# S3 separado. Requer PostgreSQL, Node.js, GnuPG e sha256sum. O fallback da AWS
+# evita depender do AWS CLI em serviços S3 compatíveis, como o Neon.
+# Segredos nunca aparecem nos argumentos dos comandos.
 set -euo pipefail
 umask 077
+
+# O runner reporta somente códigos bounded; URLs, credenciais e mensagens brutas
+# nunca entram no status persistido. A credencial fica apenas no processo filho.
+STATUS_SCRIPT="$(cd "$(dirname "$0")" && pwd)/report-backup-status.mjs"
+STATUS_URL="${BACKUP_STATUS_URL:-}"
+STATUS_TOKEN="${BACKUP_STATUS_TOKEN:-}"
+STATUS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+STATUS_BACKUP_ID=""
+STATUS_BACKUP_CREATED_AT=""
+STATUS_STAGE="validation"
+STATUS_REPORTED=false
+
+report_status() {
+  local outcome="$1"
+  local error_code="${2:-}"
+  [ "$STATUS_REPORTED" = false ] || return 0
+  STATUS_REPORTED=true
+  if [ -z "$STATUS_URL" ] && [ -z "$STATUS_TOKEN" ]; then
+    return 0
+  fi
+  if [ -z "$STATUS_URL" ] || [ -z "$STATUS_TOKEN" ]; then
+    echo "Backup status reporting is not configured completely." >&2
+    return 0
+  fi
+  local finished_at duration_ms
+  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  duration_ms="$(( $(date -u +%s) - $(date -u -d "$STATUS_STARTED_AT" +%s) ))"
+  if ! BACKUP_STATUS_URL="$STATUS_URL" \
+    BACKUP_STATUS_TOKEN="$STATUS_TOKEN" \
+    BACKUP_STATUS_STARTED_AT="$STATUS_STARTED_AT" \
+    BACKUP_STATUS_FINISHED_AT="$finished_at" \
+    BACKUP_STATUS_DURATION_MS="$duration_ms" \
+    BACKUP_STATUS_OUTCOME="$outcome" \
+    BACKUP_STATUS_BACKUP_ID="$STATUS_BACKUP_ID" \
+    BACKUP_STATUS_BACKUP_CREATED_AT="$STATUS_BACKUP_CREATED_AT" \
+    BACKUP_STATUS_ERROR_CODE="$error_code" \
+    node "$STATUS_SCRIPT"; then
+    echo "Backup status report failed; the backup exit code is unchanged." >&2
+  fi
+}
+
+on_exit() {
+  local code=$?
+  trap - EXIT
+  if [ "$code" -eq 0 ] || [ "${PUBLISH_COMPLETE:-false}" = true ]; then
+    report_status success
+  else
+    local error_code="unknown"
+    case "$STATUS_STAGE" in
+      validation|source_validation) error_code="validation_failed" ;;
+      dump) error_code="dump_failed" ;;
+      encryption) error_code="encryption_failed" ;;
+      checksum) error_code="checksum_failed" ;;
+      publish) error_code="publish_failed" ;;
+      upload) error_code="upload_failed" ;;
+      retention) error_code="retention_failed" ;;
+    esac
+    report_status failure "$error_code"
+  fi
+  if declare -F cleanup >/dev/null; then
+    if ! cleanup; then
+      echo "Backup local cleanup failed; inspect the preserved files." >&2
+    fi
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
 
 fail() {
   echo "$1" >&2
@@ -72,9 +139,9 @@ case "$BACKUP_S3_PREFIX" in
   /*|*\\*|*..*|*[[:cntrl:]]*) fail "BACKUP_S3_PREFIX must be a safe relative S3 prefix." ;;
 esac
 
-# Keep database, passphrase and both evidence/backup credentials out of the
-# environments inherited by unrelated child tools. AWS receives only its own
-# command-scoped credentials in aws_backup below.
+# Banco, passphrase e credenciais de evidências/backup ficam fora do ambiente
+# herdado por ferramentas que não precisam delas. A AWS recebe apenas as próprias
+# credenciais no escopo do comando, na função aws_backup abaixo.
 BACKUP_DB_URL="$BACKUP_DATABASE_URL"
 BACKUP_PASSPHRASE="$BACKUP_ENCRYPTION_PASSPHRASE"
 BACKUP_ACCESS_KEY_ID="${BACKUP_S3_ACCESS_KEY_ID:-}"
@@ -82,14 +149,13 @@ BACKUP_SECRET_ACCESS_KEY="${BACKUP_S3_SECRET_ACCESS_KEY:-}"
 BACKUP_SESSION_TOKEN_VALUE="${BACKUP_S3_SESSION_TOKEN:-}"
 unset BACKUP_DATABASE_URL RESTORE_DATABASE_URL BACKUP_ENCRYPTION_PASSPHRASE \
   BACKUP_S3_ACCESS_KEY_ID BACKUP_S3_SECRET_ACCESS_KEY BACKUP_S3_SESSION_TOKEN \
+  BACKUP_STATUS_TOKEN BACKUP_STATUS_URL \
   EVIDENCE_S3_ACCESS_KEY_ID EVIDENCE_S3_SECRET_ACCESS_KEY
 
 for tool in node pg_dump psql gpg sha256sum; do
   command -v "$tool" >/dev/null || fail "Required backup tool is missing: $tool"
 done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Prefer an explicitly installed AWS CLI (also used by the isolated test
-# fixtures); use the repository-pinned SDK helper when the CLI is unavailable.
 if command -v aws >/dev/null; then
   AWS_COMMAND=(aws)
 else
@@ -97,8 +163,9 @@ else
   AWS_COMMAND=(node "$SCRIPT_DIR/s3-file-transfer.mjs")
 fi
 
-# A custom-format dump preserves whatever is in the source, including an empty
-# Prisma ledger. Refuse to publish a backup that cannot be deployed afterwards.
+# O dump customizado preserva a origem, inclusive um histórico Prisma vazio.
+# Não publicamos um backup que não possa ser restaurado depois.
+STATUS_STAGE="source_validation"
 MIGRATION_TABLE_PRESENT="$(DATABASE_URI="$BACKUP_DB_URL" node "$SCRIPT_DIR/run-with-database-url.mjs" \
   psql --no-password --tuples-only --no-align --field-separator=' ' --set=ON_ERROR_STOP=1 \
   --command "SELECT to_regclass('public._prisma_migrations') IS NOT NULL;")"
@@ -132,12 +199,12 @@ WORK_DIR="$(mktemp -d "$BACKUP_DIR/.zuno-backup.XXXXXX")"
 PUBLISHED_FILES=()
 PUBLISH_COMPLETE=false
 cleanup() {
-  rm -rf -- "$WORK_DIR"
+  rm -rf -- "$WORK_DIR" || return 1
   if [ "$PUBLISH_COMPLETE" = false ] && [ "${#PUBLISHED_FILES[@]}" -gt 0 ]; then
-    rm -f -- "${PUBLISHED_FILES[@]}"
+    rm -f -- "${PUBLISHED_FILES[@]}" || return 1
   fi
+  return 0
 }
-trap cleanup EXIT
 export GNUPGHOME="$WORK_DIR/gnupg"
 mkdir -p "$GNUPGHOME"
 chmod 700 "$GNUPGHOME"
@@ -154,36 +221,41 @@ aws_backup() {
 }
 
 NAME="zuno_$(date -u +%Y%m%d_%H%M%S)_$$_${RANDOM}"
+STATUS_BACKUP_ID="$NAME"
 DUMP_FILE="$WORK_DIR/$NAME.sql.dump"
 ENCRYPTED_FILE="$WORK_DIR/$NAME.sql.dump.gpg"
 
-# Decompose the URI into PG* variables: libpq treats PGDATABASE from the
-# environment as a literal database name, not as a connection URI.
+# Separa a URI em variáveis PG*: o libpq trata PGDATABASE como nome do banco,
+# não como URI de conexão.
+STATUS_STAGE="dump"
 DATABASE_URI="$BACKUP_DB_URL" node "$(dirname "$0")/run-with-database-url.mjs" \
   pg_dump --no-password --format=custom --no-owner --no-privileges --file "$DUMP_FILE"
+STATUS_STAGE="encryption"
 printf '%s\n' "$BACKUP_PASSPHRASE" | gpg \
   --batch --yes --pinentry-mode loopback --passphrase-fd 0 --force-mdc \
   --symmetric --cipher-algo AES256 --compress-algo none \
   --output "$ENCRYPTED_FILE" "$DUMP_FILE"
 
+STATUS_STAGE="checksum"
 CHECKSUM="$(sha256sum < "$ENCRYPTED_FILE")"
 CHECKSUM="${CHECKSUM%% *}"
 printf '%s  %s\n' "$CHECKSUM" "$(basename "$ENCRYPTED_FILE")" > "$ENCRYPTED_FILE.sha256"
+STATUS_BACKUP_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '{"createdAt":"%s","sha256":"%s","format":"postgresql-custom","encryption":"gpg-aes256-mdc"}\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CHECKSUM" > "$ENCRYPTED_FILE.manifest.json"
+  "$STATUS_BACKUP_CREATED_AT" "$CHECKSUM" > "$ENCRYPTED_FILE.manifest.json"
 
 publish() {
   local source="$1"
   local destination="$BACKUP_DIR/$(basename "$source")"
-  # Hard-link publication is atomic and fails rather than overwriting an
-  # existing artifact. WORK_DIR is on the same filesystem as BACKUP_DIR.
+  # O hard link torna a publicação atômica e impede sobrescrever um artefato.
+  # WORK_DIR e BACKUP_DIR ficam no mesmo sistema de arquivos.
   ln -- "$source" "$destination"
   PUBLISHED_FILES+=("$destination")
 }
+STATUS_STAGE="publish"
 publish "$ENCRYPTED_FILE"
 publish "$ENCRYPTED_FILE.sha256"
 publish "$ENCRYPTED_FILE.manifest.json"
-PUBLISH_COMPLETE=true
 
 AWS_ARGS=(--region "$BACKUP_S3_REGION")
 if [ -n "${BACKUP_S3_ENDPOINT_URL:-}" ]; then
@@ -192,12 +264,17 @@ fi
 REMOTE_PREFIX="${BACKUP_S3_PREFIX}/"
 REMOTE_BASE="s3://$BACKUP_S3_BUCKET/$REMOTE_PREFIX"
 REMOTE_NAME="$(basename "$ENCRYPTED_FILE")"
+STATUS_STAGE="upload"
 aws_backup "${AWS_ARGS[@]}" s3 cp "$ENCRYPTED_FILE" "$REMOTE_BASE$REMOTE_NAME" --sse AES256 --only-show-errors
 aws_backup "${AWS_ARGS[@]}" s3 cp "$ENCRYPTED_FILE.sha256" "$REMOTE_BASE$REMOTE_NAME.sha256" --only-show-errors
 aws_backup "${AWS_ARGS[@]}" s3 cp "$ENCRYPTED_FILE.manifest.json" "$REMOTE_BASE$REMOTE_NAME.manifest.json" --only-show-errors
+# Só agora o tripleto remoto está completo; falhas de upload limpam a publicação local.
+PUBLISH_COMPLETE=true
+STATUS_STAGE="retention"
 
-# Retain only canonical backup triplets under the dedicated prefix. Sidecars
-# and unrelated objects never count toward the retention window or get deleted.
+# Remove apenas backups completos dentro do prefixo dedicado que ficaram mais
+# antigos que o corte. Sidecars soltos e objetos de outros sistemas não entram
+# na retenção nem são apagados.
 RETENTION_CUTOFF_EPOCH="$(date -u -d "$RETENTION_DAYS days ago" +%s)"
 LIST_OUTPUT="$(aws_backup "${AWS_ARGS[@]}" s3api list-objects-v2 \
   --bucket "$BACKUP_S3_BUCKET" \
@@ -210,8 +287,8 @@ while IFS=$'\t' read -r key modified_at; do
   if [[ "$key" != "$REMOTE_PREFIX"* || ! "$backup_name" =~ ^zuno_[0-9]{8}_[0-9]{6}_[0-9]+_[0-9]+\.sql\.dump\.gpg$ ]]; then
     continue
   fi
-  # Fail closed on malformed listings or timestamps: never delete an object
-  # unless AWS reports it inside the dedicated prefix and older than the cutoff.
+  # Se a lista ou a data estiver malformada, nada é apagado. Só removemos objetos
+  # que a AWS confirmou dentro do prefixo dedicado e antes do corte.
   [ -n "$modified_at" ] || continue
   modified_epoch="$(date -u -d "$modified_at" +%s 2>/dev/null)" || continue
   if [ "$modified_epoch" -le "$RETENTION_CUTOFF_EPOCH" ]; then
