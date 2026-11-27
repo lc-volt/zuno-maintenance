@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   maintenance:
-    name: Run bounded outbox, purge, re-encryption and scheduler maintenance
+    name: Run bounded outbox, purge, PQC and scheduler maintenance
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -121,6 +121,7 @@ jobs:
             .data.ok == true and
             (.data.budgetExhausted != true) and
             (.data.results.reencrypt != null) and
+            ([.data.results.reencrypt.status] | all(. == "RUNNING" or . == "COMPLETED")) and
             ([.data.schedulerHooks[]? | select(.status == "failed")] | length == 0)
           ' >/dev/null
           if printf '%s\n' "$response" | jq -e 'any(.data.schedulerHooks[]?; .status == "not_configured")' >/dev/null; then

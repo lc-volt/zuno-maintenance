@@ -15,8 +15,9 @@ The API job authenticates only through GitHub OIDC. The token's `repository`,
 stored in the `ZUNO_API_URL` repository variable. Every run mints a short-lived
 token that the API verifies and consumes once. The job calls
 `POST /api/v1/operations/maintenance` with
-`{tasks:["outbox","purge","schedulers"],batchSize:50,timeBudgetMs:20000}` and
-fails if the API reports an unhealthy result.
+`{tasks:["outbox","purge","reencrypt","schedulers"],batchSize:50,timeBudgetMs:20000}` and
+fails if the API reports an unhealthy result. The `reencrypt` task advances at
+most one persistent PQC field-key rotation batch per invocation.
 
 The separate backup job runs `scripts/backup.sh` on the GitHub-hosted Ubuntu
 runner, never in the web container. It lists the dedicated backup prefix and
