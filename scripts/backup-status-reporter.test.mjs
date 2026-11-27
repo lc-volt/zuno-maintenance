@@ -26,47 +26,30 @@ test('status URL rejects credentials, query, fragment, wrong path and insecure r
     'https://status.example.com/api/v1/operations',
     'http://status.example.com/api/v1/operations/backup-status',
   ]) {
-    assert.throws(() => validateStatusUrl(value, { production: true }), {
-      code: /status/,
-    });
+    assert.throws(() => validateStatusUrl(value, { production: true }), { code: /status/ });
   }
   assert.equal(
-    validateStatusUrl('http://127.0.0.1:3000/api/v1/operations/backup-status')
-      .protocol,
+    validateStatusUrl('http://127.0.0.1:3000/api/v1/operations/backup-status').protocol,
     'http:',
   );
   assert.throws(
     () =>
-      validateStatusUrl(
-        'http://127.0.0.1:3000/api/v1/operations/backup-status',
-        {
-          production: true,
-        },
-      ),
+      validateStatusUrl('http://127.0.0.1:3000/api/v1/operations/backup-status', {
+        production: true,
+      }),
     { code: 'insecure_status_url' },
   );
 });
 
 test('payload validation rejects unknown fields and inconsistent outcomes', () => {
+  assert.throws(() => validateStatusPayload({ ...payload, databaseUrl: 'secret' }), {
+    code: 'invalid_payload',
+  });
+  assert.throws(() => validateStatusPayload({ ...payload, errorCode: 'upload_failed' }), {
+    code: 'invalid_payload',
+  });
   assert.throws(
-    () => validateStatusPayload({ ...payload, databaseUrl: 'secret' }),
-    {
-      code: 'invalid_payload',
-    },
-  );
-  assert.throws(
-    () => validateStatusPayload({ ...payload, errorCode: 'upload_failed' }),
-    {
-      code: 'invalid_payload',
-    },
-  );
-  assert.throws(
-    () =>
-      validateStatusPayload({
-        ...payload,
-        outcome: 'failure',
-        errorCode: 'upload_failed',
-      }),
+    () => validateStatusPayload({ ...payload, outcome: 'failure', errorCode: 'upload_failed' }),
     { code: 'invalid_payload' },
   );
   assert.doesNotThrow(() =>
@@ -88,17 +71,13 @@ test('reporter sends the credential only in the bearer header over loopback', as
       method: request.method,
       url: request.url,
       authorization: request.headers.authorization,
+      idempotencyKey: request.headers['idempotency-key'],
       payload: JSON.parse(body),
     };
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(
       JSON.stringify({
-        data: {
-          accepted: true,
-          duplicate: false,
-          outOfOrder: false,
-          status: {},
-        },
+        data: { accepted: true, duplicate: false, outOfOrder: false, status: {} },
       }),
     );
   });
@@ -113,8 +92,30 @@ test('reporter sends the credential only in the bearer header over loopback', as
   assert.equal(received.method, 'POST');
   assert.equal(received.url, '/api/v1/operations/backup-status');
   assert.equal(received.authorization, `Bearer ${token}`);
+  assert.match(received.idempotencyKey, /^[A-Fa-f0-9]{64}$/);
   assert.deepEqual(received.payload, payload);
   assert.ok(!loopbackUrl.includes(token));
+});
+
+test('idempotency keys are stable across property order and change with the report', async () => {
+  const calls = [];
+  const fetchImpl = async (_url, init) => {
+    calls.push(init);
+    return {
+      ok: true,
+      json: async () => ({ accepted: true, status: {} }),
+    };
+  };
+  const options = { url, token, fetchImpl };
+
+  await reportBackupStatus(payload, options);
+  await reportBackupStatus(Object.fromEntries(Object.entries(payload).reverse()), options);
+  await reportBackupStatus({ ...payload, durationMs: payload.durationMs + 1 }, options);
+
+  const [first, reordered, changed] = calls.map((call) => call.headers['idempotency-key']);
+  assert.match(first, /^[A-Fa-f0-9]{64}$/);
+  assert.equal(first, reordered);
+  assert.notEqual(first, changed);
 });
 
 test('reporter does not follow redirects or expose response bodies in errors', async (t) => {
@@ -127,12 +128,9 @@ test('reporter does not follow redirects or expose response bodies in errors', a
   const address = server.address();
   const loopbackUrl = `http://127.0.0.1:${address.port}/api/v1/operations/backup-status`;
 
-  await assert.rejects(
-    reportBackupStatus(payload, { url: loopbackUrl, token }),
-    (error) => {
-      assert.equal(error.code, 'status_request_failed');
-      assert.doesNotMatch(error.message, /sensitive-provider-response/);
-      return true;
-    },
-  );
+  await assert.rejects(reportBackupStatus(payload, { url: loopbackUrl, token }), (error) => {
+    assert.equal(error.code, 'status_request_failed');
+    assert.doesNotMatch(error.message, /sensitive-provider-response/);
+    return true;
+  });
 });

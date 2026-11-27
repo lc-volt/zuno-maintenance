@@ -97,6 +97,7 @@ jobs:
                 --proto '=https' --tlsv1.2 \
                 --connect-timeout 15 --max-time 90 \
                 --header 'Content-Type: application/json' \
+                --header "Idempotency-Key: github-maintenance-${REQUEST_ID}" \
                 --header "@${header_file}" \
                 --data-binary "$request_body" \
                 "${ZUNO_API_URL%/}/api/v1/operations/maintenance")"; then

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const MAX_AGE_SKEW_MS = 5 * 60_000;
 const ERROR_CODES = new Set([
   'validation_failed',
@@ -35,8 +37,7 @@ function fail(code) {
 }
 
 function iso(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(value))
-    return null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(value)) return null;
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? timestamp : null;
 }
@@ -49,36 +50,25 @@ export function validateStatusUrl(value, { production = false } = {}) {
     fail('invalid_status_url');
   }
   const loopback =
-    url.hostname === 'localhost' ||
-    url.hostname === '127.0.0.1' ||
-    url.hostname === '[::1]';
-  if (
-    url.protocol !== 'https:' &&
-    !(url.protocol === 'http:' && loopback && !production)
-  ) {
+    url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback && !production)) {
     fail('insecure_status_url');
   }
-  if (url.username || url.password || url.search || url.hash)
-    fail('unsafe_status_url');
-  if (url.pathname !== '/api/v1/operations/backup-status')
-    fail('invalid_status_path');
+  if (url.username || url.password || url.search || url.hash) fail('unsafe_status_url');
+  if (url.pathname !== '/api/v1/operations/backup-status') fail('invalid_status_path');
   return url;
 }
 
 export function validateStatusPayload(payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
-    fail('invalid_payload');
-  if (Object.keys(payload).some((key) => !ALLOWED_FIELDS.has(key)))
-    fail('invalid_payload');
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) fail('invalid_payload');
+  if (Object.keys(payload).some((key) => !ALLOWED_FIELDS.has(key))) fail('invalid_payload');
 
   const startedAt = iso(payload.startedAt);
   const finishedAt = iso(payload.finishedAt);
   const backupCreatedAt =
     payload.backupCreatedAt === undefined ? null : iso(payload.backupCreatedAt);
-  if (startedAt === null || finishedAt === null || finishedAt < startedAt)
-    fail('invalid_payload');
-  if (payload.backupCreatedAt !== undefined && backupCreatedAt === null)
-    fail('invalid_payload');
+  if (startedAt === null || finishedAt === null || finishedAt < startedAt) fail('invalid_payload');
+  if (payload.backupCreatedAt !== undefined && backupCreatedAt === null) fail('invalid_payload');
   if (
     !Number.isInteger(payload.durationMs) ||
     payload.durationMs < 0 ||
@@ -86,8 +76,7 @@ export function validateStatusPayload(payload) {
   ) {
     fail('invalid_payload');
   }
-  if (payload.outcome !== 'success' && payload.outcome !== 'failure')
-    fail('invalid_payload');
+  if (payload.outcome !== 'success' && payload.outcome !== 'failure') fail('invalid_payload');
   if (payload.verified !== undefined && typeof payload.verified !== 'boolean')
     fail('invalid_payload');
   if (payload.backupId !== undefined) {
@@ -103,16 +92,11 @@ export function validateStatusPayload(payload) {
     fail('invalid_payload');
   }
   if (payload.outcome === 'success') {
-    if (
-      !payload.backupId ||
-      backupCreatedAt === null ||
-      payload.errorCode !== undefined
-    ) {
+    if (!payload.backupId || backupCreatedAt === null || payload.errorCode !== undefined) {
       fail('invalid_payload');
     }
     if (
-      (payload.verified !== true &&
-        backupCreatedAt < startedAt - MAX_AGE_SKEW_MS) ||
+      (payload.verified !== true && backupCreatedAt < startedAt - MAX_AGE_SKEW_MS) ||
       backupCreatedAt > finishedAt + MAX_AGE_SKEW_MS
     ) {
       fail('invalid_payload');
@@ -125,6 +109,15 @@ export function validateStatusPayload(payload) {
     fail('invalid_payload');
   }
   return payload;
+}
+
+function idempotencyKey(payload) {
+  const canonical = JSON.stringify(
+    Object.keys(payload)
+      .sort()
+      .map((key) => [key, payload[key]]),
+  );
+  return createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
 
 export async function reportBackupStatus(
@@ -144,6 +137,7 @@ export async function reportBackupStatus(
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
+        'idempotency-key': idempotencyKey(payload),
       },
       body: JSON.stringify(payload),
       redirect: 'error',
@@ -159,12 +153,7 @@ export async function reportBackupStatus(
   } catch {
     fail('invalid_status_response');
   }
-  if (
-    result &&
-    typeof result === 'object' &&
-    result.data &&
-    typeof result.data === 'object'
-  ) {
+  if (result && typeof result === 'object' && result.data && typeof result.data === 'object') {
     result = result.data;
   }
   if (
