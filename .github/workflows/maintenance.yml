@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   maintenance:
-    name: Run bounded outbox, purge and scheduler maintenance
+    name: Run bounded outbox, purge, re-encryption and scheduler maintenance
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -69,7 +69,7 @@ jobs:
           : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is unavailable}"
           request_body="$(jq -nc \
             --arg requestId "$REQUEST_ID" \
-            '{tasks:["outbox","purge","schedulers"],batchSize:50,timeBudgetMs:20000,requestId:$requestId}')"
+            '{tasks:["outbox","purge","reencrypt","schedulers"],batchSize:50,timeBudgetMs:20000,requestId:$requestId}')"
           header_file="$(mktemp "$RUNNER_TEMP/zuno-oidc-header.XXXXXX")"
           trap 'rm -f "$header_file"' EXIT
           response=''
@@ -120,6 +120,7 @@ jobs:
           printf '%s\n' "$response" | jq -e '
             .data.ok == true and
             (.data.budgetExhausted != true) and
+            (.data.results.reencrypt != null) and
             ([.data.schedulerHooks[]? | select(.status == "failed")] | length == 0)
           ' >/dev/null
           if printf '%s\n' "$response" | jq -e 'any(.data.schedulerHooks[]?; .status == "not_configured")' >/dev/null; then
